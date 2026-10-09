@@ -3,17 +3,18 @@
 fcp_squish.py - overlap the clips of a Final Cut Pro project so the audio flows.
 
 Given a video file and a Final Cut Pro XML export (.fcpxml or .fcpxmld) whose
-timeline is made of cuts from that video, this writes a NEW .fcpxml in which
-every clip is pulled earlier on the timeline so that it overlaps the clip
-before it. The amount of overlap is chosen by comparing audio: the start of
-each clip's audio is lined up with the matching audio at the end of the
-previous clip, so the two play the same sound during the overlap and the
-audio flows seamlessly across the cut.
+timeline is a run of tightly cut clips from that video (e.g. one line of a
+script per clip), this writes a NEW .fcpxml in which every clip slightly
+overlaps the clip before it - by 2 frames by default.
 
-Because clips in the primary storyline cannot overlap, the new project puts
-all clips on connected lanes (alternating lanes 1 and 2 by default) above a
-single gap, so the video overlaps too. A linear audio crossfade is added
-over each overlap (disable with --no-fades).
+Clips alternate between lanes 1 and 2, so every other clip sits on top of the
+clip before it and the rest tuck underneath. Each clip is its own connected
+clip, so you can drag any one of them to fine-tune its overlap.
+
+The audio is checked at every cut: if the silence between two lines is
+shorter than the overlap, the overlap is shortened so the next line doesn't
+start before the previous one has finished. A short audio crossfade covers
+each overlap (disable with --no-fades).
 
 Requirements: Python 3.8+, numpy, and ffmpeg on your PATH.
 
@@ -186,39 +187,27 @@ def segment(audio, start, length):
     return out
 
 
-def best_overlap(audio, sr, a_end, b_start, frame, min_frames, max_frames):
+def quiet_edges(audio, sr, start, end, quiet_db):
     """
-    Find how many frames k to overlap so that the last k frames of clip A
-    (ending at a_end seconds in the file) sound the same as the first k
-    frames of clip B (starting at b_start seconds). Returns (k, score) where
-    score is the normalised correlation (1.0 = identical audio).
+    Seconds of non-speech at the start and at the end of the part of the file
+    between `start` and `end` (in seconds). Audio counts as non-speech when it
+    is more than `quiet_db` dB below the clip's speaking level.
     """
-    if max_frames < min_frames:
-        return 0, 0.0
-    width = int(round(max_frames * frame * sr))
-    a_end_s = int(round(a_end * sr))
-    b_start_s = int(round(b_start * sr))
-    tail = segment(audio, a_end_s - width, width)
-    head = segment(audio, b_start_s, width)
-
-    # dot[k] = sum(tail[width-k:] * head[:k]) via FFT cross-correlation
-    n = 1 << int(np.ceil(np.log2(2 * width)))
-    corr = np.fft.irfft(np.fft.rfft(tail, n) * np.conj(np.fft.rfft(head, n)), n)
-    e_tail = np.cumsum(tail[::-1] ** 2)
-    e_head = np.cumsum(head ** 2)
-
-    best_k, best_score = 0, 0.0
-    for k in range(min_frames, max_frames + 1):
-        ks = min(int(round(k * frame * sr)), width)
-        if ks <= 0:
-            continue
-        denom = np.sqrt(e_tail[ks - 1] * e_head[ks - 1])
-        if denom <= 1e-9:
-            continue
-        score = corr[width - ks] / denom
-        if score > best_score:
-            best_k, best_score = k, float(score)
-    return best_k, best_score
+    s0, s1 = int(round(start * sr)), int(round(end * sr))
+    seg = segment(audio, s0, max(s1 - s0, 1))
+    win = max(1, sr // 200)  # 5 ms windows
+    n = seg.size // win
+    if n == 0:
+        return 0.0, 0.0
+    rms = np.sqrt(np.mean(seg[:n * win].reshape(n, win) ** 2, axis=1)) + 1e-9
+    db = 20 * np.log10(rms / 32768.0)
+    level = np.percentile(db, 95)
+    quiet = (db < level - quiet_db) | (db < -60)
+    if quiet.all():
+        return seg.size / sr, seg.size / sr
+    head = int(np.argmin(quiet))          # first loud window
+    tail = int(np.argmin(quiet[::-1]))    # first loud window from the end
+    return head * win / sr, tail * win / sr
 
 
 # --------------------------------------------------------------------------
@@ -265,23 +254,28 @@ def main():
     ap.add_argument("project", help="Final Cut Pro XML export (.fcpxml or .fcpxmld)")
     ap.add_argument("-o", "--output", help="output .fcpxml (default: <project> squished.fcpxml)")
     ap.add_argument("--project-name", help="which project to use if the XML has several")
-    ap.add_argument("--max-overlap", type=float, default=3.0,
-                    help="longest overlap to search for, in seconds (default 3.0)")
-    ap.add_argument("--min-overlap", type=int, default=2,
-                    help="shortest overlap to accept, in frames (default 2)")
-    ap.add_argument("--threshold", type=float, default=0.7,
-                    help="minimum audio match score 0-1 to accept an overlap (default 0.7)")
-    ap.add_argument("--fallback-frames", type=int, default=0,
-                    help="overlap (in frames) to use when no audio match is found (default 0)")
+    ap.add_argument("--overlap", default="2",
+                    help="how much each clip overlaps the one before it: a number "
+                         "of frames (e.g. 2) or seconds with an 's' (e.g. 0.1s). "
+                         "Default 2 frames")
+    ap.add_argument("--min-overlap", type=int, default=1,
+                    help="never overlap less than this many frames, even if the "
+                         "lines are so tight they touch (default 1)")
+    ap.add_argument("--quiet-db", type=float, default=25.0,
+                    help="audio this many dB below the speaking level counts as "
+                         "silence when checking that lines don't collide (default 25)")
+    ap.add_argument("--ignore-audio", action="store_true",
+                    help="use exactly --overlap everywhere without checking the audio")
     ap.add_argument("--lanes", choices=["alternate", "stack"], default="alternate",
-                    help="alternate: clips alternate between lanes 1 and 2. "
-                         "stack: each clip goes one lane higher, so the incoming "
-                         "clip's video is always on top (default alternate)")
+                    help="alternate: clips alternate between lanes 1 and 2, so every "
+                         "other clip sits on top of the one before it and the rest "
+                         "tuck underneath. stack: each clip goes one lane higher, so "
+                         "the incoming clip is always on top (default alternate)")
     ap.add_argument("--no-fades", action="store_true",
                     help="don't add audio crossfades over the overlaps")
     ap.add_argument("--fade-type", default="linear",
                     choices=["linear", "easeIn", "smooth", "easeOut"],
-                    help="crossfade shape (default linear, best for identical audio)")
+                    help="crossfade shape (default linear)")
     ap.add_argument("--sample-rate", type=int, default=16000,
                     help="audio analysis sample rate (default 16000)")
     args = ap.parse_args()
@@ -352,9 +346,17 @@ def main():
     if len(media_items) < 2:
         sys.exit("The project needs at least two clips in its main storyline.")
 
-    audio = decode_audio(args.video, args.sample_rate)
+    ov_text = args.overlap.strip()
+    if ov_text.endswith("s"):
+        target = int(round(float(ov_text[:-1]) / float(frame)))
+    else:
+        target = int(ov_text)
+    target = max(target, args.min_overlap)
+
+    audio = None
+    if not args.ignore_audio:
+        audio = decode_audio(args.video, args.sample_rate)
     sr = args.sample_rate
-    max_frames_cfg = int(args.max_overlap / float(frame))
 
     # Work out the overlap for each clip with the media clip before it.
     overlaps = {}
@@ -365,32 +367,25 @@ def main():
             prev = None  # a gap breaks the chain; nothing to overlap with
             continue
         if prev is not None:
-            ov_frames, score, method = 0, 0.0, "-"
-            if prev.asset_id and it.asset_id:
-                # leave at least one frame of each clip uncovered
-                limit = min(int(prev.duration / frame), int(it.duration / frame)) - 1
-                # Exact answer if the two clips share source material.
-                if (prev.asset_id == it.asset_id and
-                        prev.file_in <= it.file_in < prev.file_out):
-                    ov_frames = int(round((prev.file_out - it.file_in) / frame))
-                    ov_frames = max(0, min(ov_frames, limit))
-                    score, method = 1.0, "same source"
-                else:
-                    k, score = best_overlap(audio, sr, float(prev.file_out), float(it.file_in),
-                                            float(frame), args.min_overlap,
-                                            min(max_frames_cfg, limit))
-                    if score >= args.threshold and k > 0:
-                        ov_frames, method = k, "audio match"
-                    else:
-                        ov_frames, method = 0, "no match"
-            else:
-                method = "skipped (%s)" % (prev.why_not or it.why_not)
-            if ov_frames == 0 and args.fallback_frames > 0:
-                limit = min(int(prev.duration / frame), int(it.duration / frame)) - 1
-                ov_frames = max(0, min(args.fallback_frames, limit))
-                method += ", fallback"
+            # leave at least one frame of each clip uncovered
+            limit = max(0, min(int(prev.duration / frame), int(it.duration / frame)) - 1)
+            ov_frames, room, note = target, None, ""
+            if audio is not None and prev.asset_id and it.asset_id:
+                _, tail = quiet_edges(audio, sr, float(prev.file_in), float(prev.file_out),
+                                      args.quiet_db)
+                head, _ = quiet_edges(audio, sr, float(it.file_in), float(it.file_out),
+                                      args.quiet_db)
+                room = tail + head
+                safe = int(room / float(frame))
+                if safe < target:
+                    ov_frames = max(safe, args.min_overlap)
+                    note = ("lines touch at %d frame%s" % (ov_frames, "" if ov_frames == 1 else "s")
+                            if safe < args.min_overlap else "shortened so lines don't collide")
+            elif audio is not None:
+                note = "audio not checked (%s)" % (prev.why_not or it.why_not)
+            ov_frames = min(ov_frames, limit)
             overlaps[id(it)] = ov_frames * frame
-            report.append((prev.name, it.name, ov_frames, ov_frames * frame, score, method))
+            report.append((prev.name, it.name, ov_frames, ov_frames * frame, room, note))
         prev = it
 
     # Lay the clips out on the new timeline.
@@ -472,15 +467,17 @@ def main():
 
     # Report
     print()
-    print("%-4s %-28s %-28s %8s %8s %6s  %s" % ("#", "outgoing clip", "incoming clip",
-                                              "frames", "seconds", "score", "how"))
-    for i, (a, b, fr, sec, score, method) in enumerate(report, 1):
-        print("%-4d %-28.28s %-28.28s %8d %8.3f %6.2f  %s"
-              % (i, a, b, fr, float(sec), score, method))
-    unmatched = sum(1 for r in report if r[2] == 0)
+    print("'room' is the silence between the two lines: overlapping by more than")
+    print("that makes the next line start before the previous one has finished.")
     print()
-    print("Clips: %d   overlaps found: %d   no overlap: %d"
-          % (len(placed), len(report) - unmatched, unmatched))
+    print("%-4s %-24s %-24s %7s %8s %7s  %s" % ("#", "outgoing clip", "incoming clip",
+                                              "frames", "seconds", "room", ""))
+    for i, (a, b, fr, sec, room, note) in enumerate(report, 1):
+        print("%-4d %-24.24s %-24.24s %7d %8.3f %7s  %s"
+              % (i, a, b, fr, float(sec), "-" if room is None else "%.3f" % room, note))
+    print()
+    print("Clips: %d   cuts: %d   shortened or touching: %d"
+          % (len(placed), len(report), sum(1 for r in report if r[5] and "audio" not in r[5])))
     print("Timeline length: %.2fs -> %.2fs"
           % (float(sum(it.duration for it in items)), float(total)))
     if dropped:

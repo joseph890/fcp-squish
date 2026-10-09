@@ -1,10 +1,17 @@
 # fcp-squish
 
-Takes a video file and a Final Cut Pro project made of cuts from that video,
-and writes a **new** project where each clip overlaps the one before it.
-The overlap is picked by matching audio, so the start of each clip's audio
-lines up with the matching audio at the end of the clip before it, and the
-sound flows across the cut with no seam. The video overlaps too.
+For a voiceover or to-camera read that's already been cut down to tight
+clips (one line per clip, silences and flubs removed): takes the video file
+and the Final Cut Pro project, and writes a **new** project where each clip
+slightly overlaps the one before it, by 2 frames by default.
+
+- Clips alternate between lanes 1 and 2: every other clip sits **on top of**
+  the clip before it, and the next one tucks **underneath**.
+- Every clip is its own connected clip, so you can fine-tune any overlap by
+  dragging that clip.
+- The audio is checked at every cut. If the silence between two lines is
+  shorter than the overlap, the overlap is shortened so the next line doesn't
+  start before the previous one finishes.
 
 ## Requirements
 
@@ -28,54 +35,42 @@ sound flows across the cut with no seam. The video overlaps too.
 3. In Final Cut Pro choose **File > Import > XML...** and pick the new file.
    It comes in as a project named `<original name> (squished)`.
 
-## What it does
+## What it prints
 
-For each pair of clips next to each other on the timeline:
+A table with one row per cut:
 
-- **Same source material**: if the next clip starts at a point in the video
-  that the previous clip already covers, the overlap is exactly that shared
-  part.
-- **Otherwise it compares audio**: it tries every overlap from
-  `--min-overlap` frames up to `--max-overlap` seconds and scores how closely
-  the last N frames of the outgoing clip match the first N frames of the
-  incoming clip (1.0 = identical audio). The best score is used if it beats
-  `--threshold`. If nothing matches, the clips are left butted together, or
-  overlapped by `--fallback-frames` if you set it.
+```
+#    outgoing clip   incoming clip   frames  seconds    room
+1    Line 1          Line 2               2    0.080   0.245
+2    Line 2          Line 3               1    0.040   0.055  shortened so lines don't collide
+3    Line 3          Line 4               1    0.040   0.000  lines touch at 1 frame
+```
 
-Overlaps are whole frames so Final Cut accepts the edit points.
-
-Clips in Final Cut's main storyline can't overlap, so the new project puts
-one gap in the main storyline and every clip on a connected lane above it,
-alternating between lanes 1 and 2. A linear audio crossfade covers each
-overlap so the matching audio hands off cleanly. Titles and other clips that
-were connected to a clip move with it, on lanes above the clips.
+**room** is the silence between the end of one line and the start of the
+next. You can drag a clip earlier by up to that much before the lines run
+into each other.
 
 ## Options
 
 | option | default | meaning |
 | --- | --- | --- |
-| `-o, --output` | `<project> squished.fcpxml` | output file |
-| `--max-overlap` | `3.0` | longest overlap to search for, in seconds |
-| `--min-overlap` | `2` | shortest overlap to accept, in frames |
-| `--threshold` | `0.7` | lowest audio match score (0-1) to accept |
-| `--fallback-frames` | `0` | overlap to use when no match is found |
-| `--lanes` | `alternate` | `alternate` puts clips on lanes 1/2; `stack` puts each clip one lane higher so the incoming clip's video is always on top |
-| `--no-fades` | off | don't add audio crossfades |
+| `--overlap` | `2` | overlap at each cut, in frames (`3`) or seconds (`0.1s`) |
+| `--min-overlap` | `1` | never overlap less than this many frames, even where lines touch |
+| `--ignore-audio` | off | use exactly `--overlap` everywhere, without checking the audio |
+| `--quiet-db` | `25` | how far below your speaking level counts as silence |
+| `--lanes` | `alternate` | `alternate`: on top / underneath, on lanes 1 and 2. `stack`: each clip one lane higher, so the incoming clip is always on top |
+| `--no-fades` | off | don't add a short audio crossfade over each overlap |
 | `--fade-type` | `linear` | `linear`, `easeIn`, `smooth` or `easeOut` |
+| `-o, --output` | `<project> squished.fcpxml` | output file |
 | `--project-name` | first project | which project to use if the XML holds several |
 
-## Limitations
+## Notes
 
-- Audio matching works when the overlapping audio is actually the same
-  recording (the same moment in the video, or a section that repeats). Two
-  separate takes of the same line won't match closely enough. Lower
-  `--threshold` or use `--fallback-frames` for those.
-- With `--lanes alternate`, the video on top during an overlap switches back
-  and forth between the incoming and outgoing clip. Use `--lanes stack` if
-  the incoming clip should always be on top.
-- Transitions in the main storyline are dropped (the overlaps replace them).
-  Retimed clips and compound or multicam clips stay in order but don't get
-  an overlap.
+- Dragging a clip moves just that clip; the clips after it stay put.
+- Transitions in the main storyline are dropped. Titles and other clips
+  connected to a clip move with it, on a lane above the clips.
+- Retimed, compound and multicam clips get the overlap you asked for, but
+  their audio isn't checked.
 
 ## Testing
 
